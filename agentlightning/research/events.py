@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import importlib.metadata
 import json
 import math
 import os
@@ -117,7 +118,10 @@ def initialize(directory: str | Path, metadata: dict[str, Any]) -> Path:
         dirty = subprocess.check_output(["git", "status", "--porcelain"], text=True)
     except (OSError, subprocess.CalledProcessError):
         commit, diff, dirty = None, b"", None
-    from agentlightning import __version__
+    try:
+        package_version = importlib.metadata.version("agentlightning")
+    except importlib.metadata.PackageNotFoundError:
+        package_version = None
 
     source_root = Path(__file__).parents[2]
     source_hashes = {
@@ -132,7 +136,7 @@ def initialize(directory: str | Path, metadata: dict[str, Any]) -> Path:
         "run_id": metadata.get("run_id") or identifier(),
         "created_utc": utc_now(),
         "code_version": commit,
-        "package_version": __version__,
+        "package_version": package_version,
         "working_tree_status": dirty,
         "tracked_diff_sha256": hashlib.sha256(diff).hexdigest(),
         "source_sha256": source_hashes,
