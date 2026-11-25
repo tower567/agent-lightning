@@ -217,3 +217,76 @@ def test_confirmed_budget_rate_has_explicit_started_denominator(tmp_path):
     rate = report["rates"]["time_budget_exhaustion_rate"]
     assert rate["numerator"] == 1 and rate["denominator"] == 2 and rate["value"] == 0.5
     assert rate["n_termination_unknown"] == 0
+
+
+def test_sdk_gateway_retries_count_even_without_upstream_model_calls(tmp_path):
+    from agentlightning.research.events import initialize
+
+    initialize(
+        tmp_path,
+        {
+            "model_version": None,
+            "dataset_version": "sdk-fixture",
+            "sampling_parameters": {},
+            "execution_budget": {},
+            "seed": None,
+            "fault_config": {"synthetic": True},
+        },
+    )
+    recorder = Recorder(tmp_path)
+    recorder.emit("rollout_scheduled", "r", task_id="task")
+    recorder.emit("rollout_started", "r")
+    for i in range(3):
+        with recorder.call(
+            "gateway", "r", request={}, retry_group_id="sdk-operation", parent_call_id="sdk-operation"
+        ) as call:
+            call.result.update(
+                response={"http_status": 503 if i < 2 else 200}, error={"type": "GatewayHTTPStatus"} if i < 2 else None
+            )
+    recorder.emit("rollout_finished", "r", process_exit_code=0)
+    report = analyze([tmp_path], tmp_path / "analysis", plots=False, n_bootstrap=10)
+    import csv
+
+    with (tmp_path / "analysis/rollouts.csv").open(encoding="utf-8-sig") as stream:
+        row = next(csv.DictReader(stream))
+    assert row["retry_count"] == row["sdk_gateway_retry_count"] == "2"
+    assert row["upstream_retry_count"] == "0"
+    assert row["first_fault_kind"] == "gateway"
+    assert report["rates"]["retry_recovery_rate"]["value"] == 1
+
+
+def test_nested_upstream_and_sdk_retries_are_not_double_counted(tmp_path):
+    from agentlightning.research.events import initialize
+
+    initialize(
+        tmp_path,
+        {
+            "model_version": None,
+            "dataset_version": "nested-fixture",
+            "sampling_parameters": {},
+            "execution_budget": {},
+            "seed": None,
+            "fault_config": {"synthetic": True},
+        },
+    )
+    recorder = Recorder(tmp_path)
+    recorder.emit("rollout_scheduled", "r", task_id="task")
+    recorder.emit("rollout_started", "r")
+    for outer, inner_count in [(0, 2), (1, 1)]:
+        with recorder.call("gateway", "r", request={}, retry_group_id="logical", parent_call_id="logical") as gateway:
+            for inner in range(inner_count):
+                with recorder.call(
+                    "llm", "r", request={}, retry_group_id="logical", parent_call_id="logical", attempt_index=inner
+                ) as model:
+                    model.result["error"] = {"type": "HTTP503"} if outer == 0 else None
+            gateway.result["error"] = {"type": "HTTP503"} if outer == 0 else None
+    recorder.emit("rollout_finished", "r", process_exit_code=0)
+    report = analyze([tmp_path], tmp_path / "analysis", plots=False, n_bootstrap=10)
+    import csv
+
+    with (tmp_path / "analysis/rollouts.csv").open(encoding="utf-8-sig") as stream:
+        row = next(csv.DictReader(stream))
+    assert row["retry_count"] == "2"
+    assert row["sdk_gateway_retry_count"] == row["upstream_retry_count"] == "1"
+    assert row["retry_episodes"] == "1"
+    assert report["rates"]["retry_recovery_rate"]["value"] == 1

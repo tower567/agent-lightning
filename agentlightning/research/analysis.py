@@ -243,15 +243,39 @@ def summarize_rollout(events, metadata):
     for c in calls:
         if c["kind"] in {"llm", "tool", "evaluation"}:
             retry_groups[(c["kind"], c.get("retry_group_id") or c["call_id"])].append(c)
-    episodes = [group for group in retry_groups.values() if len(group) > 1]
-    extra = [c for group in episodes for c in group[1:]]
+    physical_episodes = {key: group for key, group in retry_groups.items() if len(group) > 1}
+    extra = [c for group in physical_episodes.values() for c in group[1:]]
+    gateway_groups = defaultdict(list)
+    for call in calls:
+        if call["kind"] == "gateway":
+            gateway_groups[call.get("retry_group_id") or call["call_id"]].append(call)
+    sdk_retries = sum(len(group) - 1 for group in gateway_groups.values())
+    upstream_retries = 0
+    for (kind, group_id), group in retry_groups.items():
+        if kind != "llm":
+            continue
+        if group_id in gateway_groups and all(c.get("attempt_index") is not None for c in group):
+            upstream_retries += sum(c["attempt_index"] > 0 for c in group)
+        else:
+            upstream_retries += len(group) - 1
+    tool_eval_retries = sum(len(group) - 1 for (kind, _), group in retry_groups.items() if kind != "llm")
+    retry_count = upstream_retries + sdk_retries + tool_eval_retries
+    # One logical episode per operation. Outer SDK retries replace, rather than duplicate, its wire episode.
+    episode_map = dict(physical_episodes)
+    for group_id, group in gateway_groups.items():
+        if len(group) > 1:
+            episode_map[("llm", group_id)] = group
+    episodes = list(episode_map.values())
     recovered = sum(group[0]["ok"] is False and any(c["ok"] is True for c in group[1:]) for group in episodes)
     recovery_eligible = sum(group[0]["ok"] is False for group in episodes)
     # Comparable requests are a behavior clue; no attempt is removed using their content.
     logical = clients or [group[0] for (kind, _), group in retry_groups.items() if kind == "llm"]
     repeated, consecutive = repeated_behavior(sorted(logical + tools, key=lambda c: c["start"]["event_seq"]))
     tool_repeated, tool_consecutive = repeated_behavior(tools)
-    failures = [c for c in calls if c["kind"] in {"llm", "tool", "evaluation"} and c["ok"] is False]
+    failures = sorted(
+        [c for c in calls if c["kind"] in {"llm", "llm_client", "gateway", "tool", "evaluation"} and c["ok"] is False],
+        key=lambda c: c["end"]["event_seq"],
+    )
     first_failure = failures[0] if failures else None
     fault_round = None
     if first_failure:
@@ -310,12 +334,23 @@ def summarize_rollout(events, metadata):
         "estimated_cost_observed_lower_bound_usd": sum(v for v in prices if v is not None),
         "tool_errors": sum(c["ok"] is False for c in tools),
         "unfinished_tool_calls": sum(not c["finished"] for c in tools),
-        "retry_count": len(extra),
+        "retry_count": retry_count,
+        "upstream_retry_count": upstream_retries,
+        "sdk_gateway_retry_count": sdk_retries,
+        "tool_evaluation_retry_count": tool_eval_retries,
+        "sdk_attempt_coverage": "gateway_received_only; pre_gateway_network_retries_unavailable",
         "retry_episodes": len(episodes),
         "recovery_eligible_episodes": recovery_eligible,
         "recovered_retry_episodes": recovered,
         "retry_recovery_rate": ratio(recovered, recovery_eligible),
         "retry_extra_call_seconds": complete_sum([c["duration"] for c in extra]),
+        "retry_gateway_extra_seconds": complete_sum(
+            [c["duration"] for group in gateway_groups.values() for c in group[1:]]
+        ),
+        "retry_episode_elapsed_seconds_sum": complete_sum(
+            [elapsed(group[0]["start"], group[-1]["end"]) for group in episodes]
+        ),
+        "retry_pending_episodes": sum(any(not c["finished"] for c in group) for group in episodes),
         "retry_extra_tokens": complete_sum([token_count(c, "completion_tokens") for c in extra if c["kind"] == "llm"]),
         "retry_extra_estimated_usd": complete_sum([price(c, metadata) for c in extra if c["kind"] == "llm"]),
         "retry_wait_seconds": complete_sum([c["duration"] for c in calls if c["kind"] == "retry_wait"]),
@@ -329,9 +364,10 @@ def summarize_rollout(events, metadata):
         "first_fault_round_source": "explicit_or_preceding_recorded_round"
         if fault_round is not None
         else "unavailable",
-        "first_fault_seconds": elapsed(start, first_failure["start"]) if first_failure else None,
+        "first_fault_call_started_seconds": elapsed(start, first_failure["start"]) if first_failure else None,
+        "first_fault_seconds": elapsed(start, first_failure["end"]) if first_failure else None,
         "fault_status": "observed_fault" if first_failure else "no_observed_fault",
-        "retry_status": "retried" if extra else "no_observed_retry",
+        "retry_status": "retried" if retry_count else "no_observed_retry",
         "tool_types": sorted({c.get("tool_type") or "unknown" for c in tools}),
         "entered_rounds": round_entries,
         "interruption_round": max(round_entries)
@@ -821,6 +857,10 @@ def analyze(directories, output, *, seed=42, n_bootstrap=1000, plots=True):
         write_csv(output / f"by_{key}.csv", grouped[key])
     report["analysis_parameters"] = {
         **options,
+        "analysis_source_sha256": {
+            name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
+            for name in ["analysis.py", "events.py", "plots.py"]
+        },
         "paired_population": "task intersection; all started repetitions per condition",
         "inputs": inputs,
     }
