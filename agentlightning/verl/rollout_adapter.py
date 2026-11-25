@@ -460,6 +460,9 @@ class RolloutAdapter:
         global_steps: int = 0,
     ) -> tuple[DataProto, dict[str, Any]]:
         """Build a VERL training batch from completed rollouts."""
+        from agentlightning.research.instrumentation import adapter_input
+
+        adapter_input(completed_rollouts, self.trace_aggregator_level, global_steps)
         level = self.trace_aggregator_level
         if level not in {"transition", "trajectory"}:
             raise ValueError(f"Unknown trace_aggregator_level: {level}")
@@ -930,6 +933,9 @@ class RolloutAdapter:
             data_metrics["training/n_unmerged_rollouts"] = unmerged_count
             data_metrics["training/n_trace_merge_mismatch_rows"] = len(merge_mismatch_rows)
 
+        from agentlightning.research.instrumentation import adapter_output
+
+        adapter_output(completed_rollouts, data_proto, level, global_steps, self.reward_fillna_value)
         return data_proto, data_metrics
 
     def get_test_metrics(self, completed_rollouts: list[CompletedRollout], *, global_steps: int = 0) -> dict[str, Any]:

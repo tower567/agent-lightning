@@ -11,6 +11,8 @@ from typing import Any
 from fastapi import APIRouter, Query
 from fastapi.exceptions import HTTPException
 
+from agentlightning.research.events import observe
+from agentlightning.research.instrumentation import reward_observation
 from agentlightning.schemas import DEFAULT_ATTEMPT_ID, Event, EventCreate
 from agentlightning.server.store import _events, _rollouts
 
@@ -48,6 +50,15 @@ def record_event(rollout_id: str, attempt_id: str, event_type: str, data: dict[s
     if rollout_id not in _rollouts:
         raise _not_found(rollout_id)
 
+    observe("framework_event", rollout_id, attempt_id=attempt_id, framework_event_type=event_type, raw_data=data)
+    if event_type == "reward":
+        reward_observation(
+            data.get("value"),
+            reason=data.get("reason"),
+            rollout_id=rollout_id,
+            success=data.get("success"),
+            source="server_event_ingestion",
+        )
     rid_events = _events[rollout_id]
     if attempt_id not in rid_events:
         rid_events[attempt_id] = []

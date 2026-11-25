@@ -1,0 +1,11 @@
+{
+  "model_version": {"name": "Llama-3.2-3B-Instruct", "revision": null},
+  "harness_version": "Agent Lightning, exact commit captured automatically",
+  "dataset_version": {"name": "HotpotQA", "revision": null, "selected_ids_sha256": null},
+  "sampling_parameters": {"temperature": 1.0, "top_k": null, "top_p": null},
+  "execution_budget": {"search_loop_turns": 4, "final_fallback_calls": 1, "tokens_per_call": 500, "timeout_seconds": 3600},
+  "seed": null,
+  "fault_config": {"enabled": false},
+  "pricing_usd_per_million": null,
+  "condition": "control"
+}

@@ -21,6 +21,7 @@ import structlog
 from omegaconf import DictConfig
 
 from agentlightning.client import AgentLightningAsyncClient
+from agentlightning.research.events import current_rollout, error_info, observe
 from agentlightning.schemas import DEFAULT_ATTEMPT_ID, Rollout, RolloutPatch, RolloutState, RolloutStatusPatch
 
 log = structlog.get_logger()
@@ -33,6 +34,7 @@ def _is_native_windows() -> bool:
 
 
 def _run_local_reconciler_worker(agent_class_path: str) -> int:
+    observe("rollout_started", current_rollout(), source="local_worker", agent_class=agent_class_path)
     try:
         if ":" in agent_class_path:
             module_name, class_name = agent_class_path.split(":", 1)
@@ -44,8 +46,17 @@ def _run_local_reconciler_worker(agent_class_path: str) -> int:
         result = loaded().run()
         if inspect.isawaitable(result):
             asyncio.run(result)  # type: ignore[arg-type]
+        observe("worker_finished", current_rollout(), process_exit_code=0)
         return 0
-    except Exception:
+    except BaseException as exc:
+        observe(
+            "worker_finished",
+            current_rollout(),
+            process_exit_code=1 if isinstance(exc, Exception) else None,
+            error=error_info(exc),
+        )
+        if not isinstance(exc, Exception):
+            raise
         traceback.print_exc()
         return 1
 
@@ -179,9 +190,17 @@ class LocalReconciler:
                 and (now - item.spawned_at) > timeout
                 and await self._kill_process_group(rollout_id, item)
             ):
+                observe(
+                    "termination_hint",
+                    rollout_id,
+                    reason="time_budget_exhausted",
+                    category="budget_exhaustion",
+                    budget_dimension="time",
+                )
                 await self._patch(rollout_id, RolloutState.FAILED, "local subprocess timed out")
 
     async def _finish_proc(self, rollout: Rollout, item: Proc) -> bool:
+        observe("process_exit_observed", rollout.rollout_id, process_exit_code=item.proc.returncode, killed=item.killed)
         if rollout.status.state == RolloutState.QUEUING:
             patched = await self._patch(rollout.rollout_id, RolloutState.RUNNING, last_attempt_id=item.attempt_id)
             if not patched:
@@ -232,6 +251,8 @@ class LocalReconciler:
                 "AGL_EVENT_URL": (f"{agent_base_url}/api/rollouts/{rollout.rollout_id}/attempt/{attempt_id}/events"),
             }
             env.update(_build_env_from_map(rollout.input, rollout.config.local.env_map))
+            if os.environ.get("AGL_RESEARCH_RUN_DIR"):
+                env["AGL_RESEARCH_ROLLOUT_ID"] = rollout.rollout_id
             proc = await asyncio.create_subprocess_exec(
                 sys.executable,
                 "-c",
@@ -252,6 +273,7 @@ class LocalReconciler:
             await self._patch(rollout.rollout_id, RolloutState.FAILED, f"local subprocess spawn failed: {e}")
             return False
 
+        observe("process_spawned", rollout.rollout_id, worker_pid=proc.pid, attempt_id=attempt_id)
         self._rid_to_proc[rollout.rollout_id] = Proc(
             attempt_id=attempt_id,
             proc=proc,
@@ -270,6 +292,7 @@ class LocalReconciler:
 
         for rollout_id, item in list(self._rid_to_proc.items()):
             if item.proc.returncode is None and await self._kill_process_group(rollout_id, item):
+                observe("termination_hint", rollout_id, reason="controller_shutdown", category="external_interruption")
                 await self._patch(rollout_id, RolloutState.FAILED, "local controller shutdown")
 
     async def _patch(

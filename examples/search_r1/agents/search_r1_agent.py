@@ -15,6 +15,8 @@ from typing import Any, TypedDict, cast
 
 import httpx
 
+from agentlightning.research.events import current_rollout, observe
+from agentlightning.research.instrumentation import reward_observation, search_call, token_fields
 from examples.search_r1.agents.qa_em import compute_score_em
 
 log = logging.getLogger(__name__)
@@ -110,10 +112,17 @@ async def retrieve_doc(
     timeout: float = 30.0,
 ) -> str:
     payload: dict[str, Any] = {"queries": [query], "topk": topk, "return_scores": True}
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        response = await client.post(retrieval_url, json=payload)
-        response.raise_for_status()
-        json_resp = response.json()
+    with search_call("tool", tool_type="search", request=payload, url=retrieval_url) as observation:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(retrieval_url, json=payload)
+            if observation:
+                try:
+                    raw_response = response.json()
+                except ValueError:
+                    raw_response = {"raw_text": response.text}
+                observation.result.update(response=raw_response, http_status=response.status_code)
+            response.raise_for_status()
+            json_resp = response.json()
     retrieval_result = cast(list[RetrievalItem], json_resp["result"][0])
     return passages2string(retrieval_result)
 
@@ -146,12 +155,20 @@ async def call_llm(
     temperature: float,
     max_tokens: int,
 ) -> str:
-    response = await client.chat.completions.create(
-        model="auto",
-        messages=messages,
-        temperature=temperature,
-        max_tokens=max_tokens,
-    )
+    with search_call(
+        "llm_client", request={"messages": messages, "temperature": temperature, "max_tokens": max_tokens}
+    ) as observation:
+        extra = {"extra_headers": {"X-AGL-Research-Call-ID": observation.data["call_id"]}} if observation else {}
+        response = await client.chat.completions.create(
+            model="auto",
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            **extra,
+        )
+        if observation:
+            raw = response.model_dump(mode="json")
+            observation.result.update(response=raw, usage=raw.get("usage"), tokens=token_fields(raw))
     return response.choices[0].message.content or ""
 
 
@@ -189,17 +206,26 @@ async def call_completion(
     temperature: float,
     max_tokens: int,
 ) -> tuple[str, list[int]]:
-    response = await client.completions.create(
-        model="auto",
-        prompt=prompt_ids,
-        temperature=temperature,
-        max_tokens=max_tokens,
-    )
+    with search_call(
+        "llm_client", request={"prompt": prompt_ids, "temperature": temperature, "max_tokens": max_tokens}
+    ) as observation:
+        extra = {"extra_headers": {"X-AGL-Research-Call-ID": observation.data["call_id"]}} if observation else {}
+        response = await client.completions.create(
+            model="auto",
+            prompt=prompt_ids,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            **extra,
+        )
+        if observation:
+            raw = response.model_dump(mode="json")
+            observation.result.update(response=raw, usage=raw.get("usage"), tokens=token_fields(raw))
     response_ids = get_choice_token_ids(response.choices[0])
     return decode_token_ids(tokenizer_model, response_ids), response_ids
 
 
 async def post_reward(event_url: str, agl_key: str, reward: float, reason: str) -> None:
+    reward_observation(reward, reason=reason)
     async with httpx.AsyncClient(timeout=10.0) as client:
         response = await client.post(
             event_url,
@@ -217,6 +243,9 @@ class SearchR1Agent:
 
     async def run(self) -> None:
         setup_logging()
+        observe(
+            "capture_capabilities", current_rollout(), tools=True, evaluation=True, llm_client=True, round_entries=True
+        )
 
         question = os.environ["QUESTION"]
         answer_list = parse_golden_answers(os.environ["GOLDEN_ANSWERS"])
@@ -242,6 +271,7 @@ class SearchR1Agent:
 
         log.info("Search-R1 question=%r answers=%r max_turns=%d", question, answer_list, max_turns)
         for turn_id in range(1, max_turns + 1):
+            observe("turn_entered", current_rollout(), round_index=turn_id)
             turn_response = await call_llm(
                 client,
                 messages,
@@ -268,6 +298,7 @@ class SearchR1Agent:
             log.info("turn=%d response=%r env_feedback_chars=%d", turn_id, valid_turn_response, len(turn_env_feedback))
 
         if not finished and not invalid_action:
+            observe("turn_entered", current_rollout(), round_index=max_turns + 1)
             turn_response = await call_llm(
                 client,
                 messages,
@@ -278,9 +309,22 @@ class SearchR1Agent:
             messages.append({"role": "assistant", "content": turn_response})
             log.info("last_turn response=%r", turn_response)
 
-        reward = 0.0 if invalid_action else float(compute_score_em(rollout_content, answer_list))
-        reason = "invalid_action" if invalid_action else "em_match" if reward > 0 else "em_miss"
+        with search_call(
+            "evaluation", tool_type="qa_em", request={"rollout_content": rollout_content, "golden_answers": answer_list}
+        ) as evaluation:
+            reward = 0.0 if invalid_action else float(compute_score_em(rollout_content, answer_list))
+            reason = "invalid_action" if invalid_action else "em_match" if reward > 0 else "em_miss"
+            if evaluation:
+                evaluation.result.update(response={"reward": reward, "reason": reason, "success": reward > 0})
         await post_reward(event_url, agl_key, reward, reason)
+        exhausted = not finished and not invalid_action and extract_action(turn_response)[0] != "answer"
+        observe(
+            "termination_hint",
+            current_rollout(),
+            reason="turn_budget_exhausted" if exhausted else "invalid_action" if invalid_action else "completed",
+            category="budget_exhaustion" if exhausted else "model_execution_error" if invalid_action else "normal",
+            budget_dimension="turns" if exhausted else None,
+        )
 
         log.info("Search-R1 reward=%.3f reason=%s elapsed=%.2fs", reward, reason, time.time() - start_time)
 
@@ -290,6 +334,9 @@ class SearchR1CompletionAgent:
 
     async def run(self) -> None:
         setup_logging()
+        observe(
+            "capture_capabilities", current_rollout(), tools=True, evaluation=True, llm_client=True, round_entries=True
+        )
 
         question = os.environ["QUESTION"]
         answer_list = parse_golden_answers(os.environ["GOLDEN_ANSWERS"])
@@ -324,6 +371,7 @@ class SearchR1CompletionAgent:
             tokenizer_model,
         )
         for turn_id in range(1, max_turns + 1):
+            observe("turn_entered", current_rollout(), round_index=turn_id)
             turn_response, response_ids = await call_completion(
                 client,
                 prompt_ids,
@@ -358,6 +406,7 @@ class SearchR1CompletionAgent:
             )
 
         if not finished and not invalid_action:
+            observe("turn_entered", current_rollout(), round_index=max_turns + 1)
             turn_response, response_ids = await call_completion(
                 client,
                 prompt_ids,
@@ -368,9 +417,22 @@ class SearchR1CompletionAgent:
             rollout_content += turn_response
             log.info("last_turn response=%r response_tokens=%d", turn_response, len(response_ids))
 
-        reward = 0.0 if invalid_action else float(compute_score_em(rollout_content, answer_list))
-        reason = "invalid_action" if invalid_action else "em_match" if reward > 0 else "em_miss"
+        with search_call(
+            "evaluation", tool_type="qa_em", request={"rollout_content": rollout_content, "golden_answers": answer_list}
+        ) as evaluation:
+            reward = 0.0 if invalid_action else float(compute_score_em(rollout_content, answer_list))
+            reason = "invalid_action" if invalid_action else "em_match" if reward > 0 else "em_miss"
+            if evaluation:
+                evaluation.result.update(response={"reward": reward, "reason": reason, "success": reward > 0})
         await post_reward(event_url, agl_key, reward, reason)
+        exhausted = not finished and not invalid_action and extract_action(turn_response)[0] != "answer"
+        observe(
+            "termination_hint",
+            current_rollout(),
+            reason="turn_budget_exhausted" if exhausted else "invalid_action" if invalid_action else "completed",
+            category="budget_exhaustion" if exhausted else "model_execution_error" if invalid_action else "normal",
+            budget_dimension="turns" if exhausted else None,
+        )
 
         log.info("Search-R1 completion reward=%.3f reason=%s elapsed=%.2fs", reward, reason, time.time() - start_time)
 

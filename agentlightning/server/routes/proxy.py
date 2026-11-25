@@ -12,6 +12,7 @@ from fastapi import APIRouter, Request, Response
 from fastapi.exceptions import HTTPException
 from pydantic import BaseModel
 
+from agentlightning.research.instrumentation import gateway_observer
 from agentlightning.server.proxy import NoServersError, ProxyPauseState, ProxyRouter, forward_request
 from agentlightning.server.store import _rollouts
 
@@ -37,6 +38,7 @@ async def _wait_for_disconnect(request: Request) -> None:
 @router.post(
     "/proxy/rollout/{rollout_id}/attempt/{attempt_id}/mode/{mode}/openai/v1/{upstream_path:path}",
 )
+@gateway_observer
 async def llm_proxy(rollout_id: str, attempt_id: str, mode: str, upstream_path: str, request: Request) -> Response:
     """LLM reverse proxy — forwards to model server, captures events."""
     if mode not in {"train", "val"}:

@@ -18,6 +18,8 @@ import structlog
 from fastapi import HTTPException, Response
 from fastapi.responses import JSONResponse
 
+from agentlightning.research.events import identifier, observed_call
+from agentlightning.research.instrumentation import llm_context, token_fields
 from agentlightning.schemas import Model
 from agentlightning.server.routes.events import record_event
 from agentlightning.server.store import _models
@@ -148,7 +150,13 @@ async def forward_request(
         log.debug("Proxying request", rollout_id=rollout_id, model=server.model, path=upstream_path)
 
         started_at = time.perf_counter()
-        response = await _send_upstream_with_retries(client=client, url=url, body=body)
+        context_token = llm_context.set(
+            {**(llm_context.get() or {}), "rollout_id": rollout_id, "weight_version": server.version}
+        )
+        try:
+            response = await _send_upstream_with_retries(client=client, url=url, body=body)
+        finally:
+            llm_context.reset(context_token)
         latency_ms = (time.perf_counter() - started_at) * 1000
         response_body = (
             response.json() if response.headers.get("content-type", "").startswith("application/json") else {}
@@ -189,9 +197,42 @@ async def _send_upstream_with_retries(
     url: str,
     body: dict[str, Any],
 ) -> httpx.Response:
+    context = llm_context.get() or {}
+    group = context.get("retry_group_id") or identifier()
+    previous_call_id = None
     for attempt_index in range(_UPSTREAM_MAX_ATTEMPTS):
         try:
-            response = await client.post(url, json=body, headers={"content-type": "application/json"})
+            with observed_call(
+                "llm",
+                context.get("rollout_id"),
+                request=body,
+                url=url,
+                retry_group_id=group,
+                retry_of=previous_call_id,
+                attempt_index=attempt_index,
+                parent_call_id=context.get("parent_call_id"),
+            ) as observation:
+                if observation:
+                    previous_call_id = observation.data["call_id"]
+                response = await client.post(url, json=body, headers={"content-type": "application/json"})
+                if observation:
+                    try:
+                        raw_response = response.json()
+                    except ValueError:
+                        raw_response = {"raw_text": response.text}
+                    observation.result.update(
+                        response=raw_response,
+                        http_status=response.status_code,
+                        error=(
+                            {"type": "HTTPStatus", "category": "external_service", "status": response.status_code}
+                            if response.status_code >= 400
+                            else None
+                        ),
+                        usage=raw_response.get("usage") if isinstance(raw_response, dict) else None,
+                        tokens=token_fields(
+                            raw_response if isinstance(raw_response, dict) else None, context.get("weight_version")
+                        ),
+                    )
         except httpx.TimeoutException as exc:
             if attempt_index == _UPSTREAM_MAX_ATTEMPTS - 1:
                 raise HTTPException(status_code=504, detail="Upstream model server timed out") from exc
@@ -227,7 +268,13 @@ async def _sleep_before_retry(*, url: str, attempt_index: int, reason: str) -> N
         delay_seconds=round(delay, 3),
         reason=reason,
     )
-    await asyncio.sleep(delay)
+    with observed_call(
+        "retry_wait",
+        (llm_context.get() or {}).get("rollout_id"),
+        request={"delay_seconds": delay, "reason": reason},
+        retry_group_id=(llm_context.get() or {}).get("retry_group_id"),
+    ):
+        await asyncio.sleep(delay)
 
 
 def _is_retryable_status(status_code: int) -> bool:

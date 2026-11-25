@@ -34,6 +34,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+research = ["matplotlib>=3.8"]
 dev = [
     "pytest>=8.3.0",
     "pytest-asyncio>=0.25.0",
@@ -46,6 +47,7 @@ dev = [
 ]
 
 [project.scripts]
+agl-research = "agentlightning.research.__main__:main"
 agl-server = "agentlightning.server.__main__:main"
 agl-controller = "agentlightning.controller.__main__:main"
 

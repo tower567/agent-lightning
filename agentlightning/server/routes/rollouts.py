@@ -12,6 +12,7 @@ from fastapi import APIRouter, Query
 from fastapi.exceptions import HTTPException
 from pydantic import BaseModel
 
+from agentlightning.research.events import observe
 from agentlightning.schemas import (
     TERMINAL_STATES,
     VALID_TRANSITIONS,
@@ -102,6 +103,7 @@ async def enqueue_rollouts(body: list[RolloutCreate]) -> list[Rollout]:
     """
     results: list[Rollout] = []
     for req in body:
+        observe("enqueue_request", req.rollout_id, raw_request=req)
         if req.rollout_id is not None and req.rollout_id in _rollouts:
             results.append(_rollouts[req.rollout_id])
             continue
@@ -115,6 +117,20 @@ async def enqueue_rollouts(body: list[RolloutCreate]) -> list[Rollout]:
             config=req.config or RolloutConfig(),
             metadata=metadata,
             status=RolloutLifecycleStatus(created_at=now, updated_at=now),
+        )
+        inp = req.input if isinstance(req.input, dict) else {}
+        extra = metadata.model_extra or {}
+        observe(
+            "rollout_scheduled",
+            rollout_id,
+            task_id=extra.get("task_id")
+            or inp.get("task_id")
+            or inp.get("data_id")
+            or inp.get("instance_id")
+            or inp.get("id"),
+            repetition=metadata.model_extra.get("repetition") if metadata.model_extra else None,
+            condition=metadata.model_extra.get("condition") if metadata.model_extra else None,
+            raw_request=req,
         )
         _rollouts[rollout_id] = rollout
         _events[rollout_id] = {}
@@ -183,6 +199,7 @@ async def get_rollout(rollout_id: str) -> RolloutDetail:
 async def patch_rollout(rollout_id: str, body: RolloutPatch) -> Rollout:
     """Patch the lifecycle status of a rollout."""
     rollout = _get_rollout(rollout_id)
+    observe("rollout_patch_request", rollout_id, raw_patch=body, previous_state=rollout.status.state)
     updates = body.status.model_dump(exclude_unset=True) if body.status is not None else {}
 
     if not updates:
@@ -207,6 +224,13 @@ async def patch_rollout(rollout_id: str, body: RolloutPatch) -> Rollout:
         }
     )
     _rollouts[rollout_id] = updated
+    observe(
+        "rollout_state",
+        rollout_id,
+        state=updated_status.state.value,
+        error_message=updated_status.error_message,
+        status=updated_status,
+    )
     if "state" in updates and updated_status.state in TERMINAL_STATES:
         # One-way terminal transition (guarded above) => append exactly once.
         _terminal_order.append(rollout_id)
@@ -216,5 +240,6 @@ async def patch_rollout(rollout_id: str, body: RolloutPatch) -> Rollout:
 @router.delete("/rollouts/{rollout_id}", status_code=204)
 async def delete_rollout(rollout_id: str) -> None:
     """Delete a rollout and its events. Idempotent: missing id is a no-op."""
+    observe("rollout_deleted", rollout_id)
     _rollouts.pop(rollout_id, None)
     _events.pop(rollout_id, None)

@@ -81,6 +81,7 @@ We evaluate Agent Lightning v1.0 across several practical training domains, incl
 | [GSM8K](https://microsoft.github.io/agent-lightning/stable/55-example-gsm8k/) | POC grade-school math reasoning example. |
 | [ScienceWorld](https://microsoft.github.io/agent-lightning/stable/60-example-science-world/) | Interactive science tasks in a text-based environment. |
 | [Search-R1](https://microsoft.github.io/agent-lightning/stable/65-example-search-r1/) | Multi-turn retrieval and reasoning agent. |
+| [Trajectory research](examples/trajectory_research/README.md) | Opt-in raw event collection and CPU-only offline analysis of failures, retries and missing rewards. |
 | [LLM-in-Sandbox](https://microsoft.github.io/agent-lightning/stable/70-example-llm-in-sandbox/) | General agent with computer and code execution tools. |
 | [Coding Agent](https://microsoft.github.io/agent-lightning/stable/75-example-coding-agent/) | Coding agent trained with repository tests. |
 | [Coding Agent: MoE](https://microsoft.github.io/agent-lightning/stable/76-example-coding-agent-moe/) | Train Qwen3.5-35B-A3B with Megatron and R3. |
