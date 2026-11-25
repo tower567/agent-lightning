@@ -123,6 +123,22 @@ def test_no_success_and_unpriced_costs_are_not_zero(sample, tmp_path):
     assert report["cost_per_confirmed_success"]["generated_tokens"]["value"] is None
 
 
+def test_observer_losses_are_accumulated_per_writer(tmp_path):
+    events = [
+        {
+            "event_id": str(i),
+            "clock_id": "machine:boot",
+            "host": "machine",
+            "pid": pid,
+            "observer_lost_events_before_this_record": lost,
+        }
+        for i, (pid, lost) in enumerate([(11, 2), (11, 3), (22, 4), (22, 4)])
+    ]
+    (tmp_path / "events.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events))
+    _, integrity = load_events(tmp_path)
+    assert integrity["observer_lost_events"] == 7
+
+
 def test_adapter_baselines_use_observed_sample_weights(sample, tmp_path):
     folder, _ = sample
     recorder = Recorder(folder)

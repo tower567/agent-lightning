@@ -55,6 +55,7 @@ def load_events(directory: Path):
     events = []
     integrity = {"truncated_tail": False, "duplicate_event_ids": 0, "observer_lost_events": 0}
     seen = {}
+    writer_losses = {}
     with path.open(encoding="utf-8") as stream:
         for index, line in enumerate(stream, 1):
             try:
@@ -72,10 +73,12 @@ def load_events(directory: Path):
                 integrity["duplicate_event_ids"] += 1
                 continue  # Identity only; never deduplicate text, prompts or commands.
             seen[event_id] = event
-            integrity["observer_lost_events"] = max(
-                integrity["observer_lost_events"], event.get("observer_lost_events_before_this_record", 0)
+            writer = (event.get("clock_id"), event.get("host"), event.get("pid"))
+            writer_losses[writer] = max(
+                writer_losses.get(writer, 0), event.get("observer_lost_events_before_this_record", 0)
             )
             events.append(event)
+    integrity["observer_lost_events"] = sum(writer_losses.values())
     return events, integrity
 
 
